@@ -38,6 +38,17 @@ Para abrir, dê dois cliques em **`Abrir VoicePad.bat`** ou rode:
 pythonw voicepad.py
 ```
 
+### Gerar o .exe
+
+Para ter um `VoicePad.exe` que roda sem Python instalado:
+
+```bash
+pip install pyinstaller
+gerar_exe.bat
+```
+
+O `VoicePad.exe` aparece na pasta do projeto. O `config.json` e a pasta `sons/` ficam ao lado dele.
+
 ## Como usar
 
 1. Clique em uma tecla vazia da janela e escolha um som. Com o botão direito, você troca, toca ou remove o som.

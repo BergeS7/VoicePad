@@ -31,11 +31,14 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageTk
 os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
 import pygame  # noqa: E402
 
-BASE = Path(__file__).resolve().parent
+# No .exe (PyInstaller), config e sons ficam ao lado do executável e a logo vem embutida.
+CONGELADO = getattr(sys, "frozen", False)
+BASE = Path(sys.executable).resolve().parent if CONGELADO else Path(__file__).resolve().parent
+RECURSOS = Path(getattr(sys, "_MEIPASS", BASE))
 CONFIG = BASE / "config.json"
 SONS_DIR = BASE / "sons"
-LOGO_PNG = BASE / "assets" / "logo.png"
-LOGO_ICO = BASE / "assets" / "voicepad.ico"
+LOGO_PNG = RECURSOS / "assets" / "logo.png"
+LOGO_ICO = RECURSOS / "assets" / "voicepad.ico"
 
 CHAVE_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 NOME_APP = "VoicePad"
@@ -43,6 +46,8 @@ NOME_APP = "VoicePad"
 
 def comando_inicializacao():
     """Comando gravado no registro para abrir o VoicePad com o Windows (já na bandeja)."""
+    if CONGELADO:
+        return f'"{Path(sys.executable).resolve()}" --bandeja'
     exe = Path(sys.executable)
     pythonw = exe.with_name("pythonw.exe")
     if pythonw.exists():
