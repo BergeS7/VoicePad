@@ -98,9 +98,10 @@ DESTAQUE = "#f1c40f"
 class Audio:
     """Toca os sons com pygame (permite sobrepor e escolher a saída de áudio)."""
 
-    def __init__(self, dispositivo=None):
+    def __init__(self, dispositivo=None, reserva=True):
         self.cache = {}
         self.dispositivo = None
+        self.reserva = reserva  # se a saída escolhida não existir, usa a padrão do Windows?
         self._iniciar(dispositivo)
 
     def _iniciar(self, dispositivo):
@@ -114,9 +115,15 @@ class Audio:
                 pygame.mixer.init()
             self.dispositivo = dispositivo
         except pygame.error:
+            if not self.reserva:
+                raise
             pygame.mixer.init()
             self.dispositivo = None
         pygame.mixer.set_num_channels(32)
+
+    def abriu(self, pedido):
+        """True se a saída pedida foi aberta (e não a padrão no lugar dela)."""
+        return not pedido or self.dispositivo == pedido
 
     def trocar_dispositivo(self, dispositivo):
         self._iniciar(dispositivo or None)
@@ -152,9 +159,17 @@ class Audio:
 
 def _trabalhador_audio(fila_cmd, dispositivo):
     """Processo separado que toca na segunda saída (o pygame só abre uma saída por processo)."""
-    audio = Audio(dispositivo)
+    try:
+        # Sem reserva: se os fones sumirem, não toca nas caixas (o som sairia dobrado).
+        audio = Audio(dispositivo, reserva=False)
+    except pygame.error:
+        audio = None
     while True:
         cmd = fila_cmd.get()
+        if cmd[0] == "sair":
+            break
+        if audio is None:
+            continue
         try:
             if cmd[0] == "tocar":
                 audio.tocar(*cmd[1:])
@@ -162,11 +177,10 @@ def _trabalhador_audio(fila_cmd, dispositivo):
                 audio.parar()
             elif cmd[0] == "esquecer":
                 audio.esquecer(cmd[1])
-            elif cmd[0] == "sair":
-                break
         except Exception:
             pass
-    pygame.mixer.quit()
+    if pygame.mixer.get_init():
+        pygame.mixer.quit()
 
 
 class SaidaExtra:
@@ -175,13 +189,24 @@ class SaidaExtra:
     def __init__(self):
         self.proc = None
         self.fila = None
+        self.desejado = None  # saída escolhida, mesmo que esteja desconectada agora
 
     def definir(self, dispositivo):
+        """Abre a segunda saída. Retorna False se ela não estiver conectada agora."""
         self.fechar()
-        if dispositivo:
-            self.fila = mp.Queue()
-            self.proc = mp.Process(target=_trabalhador_audio, args=(self.fila, dispositivo), daemon=True)
-            self.proc.start()
+        self.desejado = dispositivo or None
+        if not self.desejado:
+            return True
+        if self.desejado not in Audio.listar_dispositivos():
+            return False
+        self.fila = mp.Queue()
+        self.proc = mp.Process(target=_trabalhador_audio, args=(self.fila, self.desejado), daemon=True)
+        self.proc.start()
+        return True
+
+    def pendente(self):
+        """Há uma saída escolhida que ainda não pôde ser aberta?"""
+        return self.desejado is not None and self.proc is None
 
     def enviar(self, *cmd):
         if self.fila is not None:
@@ -207,9 +232,14 @@ class App:
         self.toast_job = None
 
         self.cfg = self._carregar_config()
-        self.audio = Audio(self.cfg.get("dispositivo") or None)
+        avisos = []
+        pedido = self.cfg.get("dispositivo") or None
+        self.audio = Audio(pedido)
+        if not self.audio.abriu(pedido):
+            avisos.append(f"Saída principal não encontrada:\n{pedido}\nUsando a padrão do Windows.")
         self.extra = SaidaExtra()
-        self.extra.definir(self.cfg.get("dispositivo2") or None)
+        if not self.extra.definir(self.cfg.get("dispositivo2") or None):
+            avisos.append(f"Não achei \"{self.cfg['dispositivo2']}\".\nConecte e ela volta a tocar sozinha.")
 
         self.icone = None
         self.avisou_bandeja = False
@@ -221,6 +251,8 @@ class App:
         keyboard.hook(self._hook_teclado, suppress=True)
         self.root.after(15, self._processar_fila)
         self.root.protocol("WM_DELETE_WINDOW", self._esconder)
+        if avisos:
+            self.root.after(600, lambda: self._toast("⚠  " + "\n\n".join(avisos), "#b9770e", 6000))
 
     # ------------------------------------------------------------ config
     def _carregar_config(self):
@@ -312,6 +344,8 @@ class App:
             return
         try:
             self.audio.tocar(str(caminho), self.var_volume.get() / 100, self.var_sobrepor.get())
+            if self.extra.pendente():  # os fones foram conectados depois? tenta abrir de novo
+                self.extra.definir(self.extra.desejado)
             self.extra.enviar("tocar", str(caminho), self.var_volume2.get() / 100, self.var_sobrepor.get())
             self._piscar(tecla)
         except pygame.error as err:
@@ -579,7 +613,7 @@ class App:
         self.root.lift()
         self.root.focus_force()
 
-    def _toast(self, texto, cor):
+    def _toast(self, texto, cor, duracao=1400):
         """Aviso pequeno no canto da tela, visível mesmo com a janela minimizada."""
         if self.toast_win is not None:
             self.toast_win.destroy()
@@ -601,16 +635,20 @@ class App:
             if self.toast_win is t:
                 t.destroy()
                 self.toast_win = None
-        self.toast_job = self.root.after(1400, fechar)
+        self.toast_job = self.root.after(duracao, fechar)
 
     def _trocar_dispositivo(self, _e=None):
         nome = self.var_dispositivo.get()
-        self.audio.trocar_dispositivo("" if nome == "Padrão do Windows" else nome)
+        pedido = "" if nome == "Padrão do Windows" else nome
+        self.audio.trocar_dispositivo(pedido)
+        if not self.audio.abriu(pedido):
+            self._toast(f"⚠  Não consegui abrir \"{nome}\".\nUsando a padrão do Windows.", "#b9770e", 4000)
         self._salvar_config()
 
     def _trocar_dispositivo2(self, _e=None):
         nome = self.var_dispositivo2.get()
-        self.extra.definir(None if nome == NENHUMA else nome)
+        if not self.extra.definir(None if nome == NENHUMA else nome):
+            self._toast(f"⚠  \"{nome}\" não está conectado.\nConecte e ela volta a tocar sozinha.", "#b9770e", 4000)
         self._salvar_config()
 
     def _sair(self):
