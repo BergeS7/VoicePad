@@ -18,6 +18,7 @@
 - Com o modo **inativo**, o teclado numérico funciona normalmente.
 - **Duas saídas de áudio ao mesmo tempo**, cada uma com o seu volume: uma para a call (ex.: CABLE Input) e outra para você ouvir (seus fones).
 - Aceita **mp3, wav, ogg e flac**. Os sons escolhidos são copiados para a pasta `sons/`.
+- **Gravar pelo microfone:** grave um som, ouça a prévia e salve direto numa tecla, com corte automático do silêncio do começo e do fim.
 - Ícone na **bandeja do Windows**: colorido com bolinha verde quando ativo, cinza quando inativo.
 - Opção **Iniciar com o Windows**, que abre direto na bandeja.
 - Aviso na tela ao ligar e desligar, e opção para sobrepor sons ou tocar um de cada vez.
@@ -51,7 +52,7 @@ O `VoicePad.exe` aparece na pasta do projeto. O `config.json` e a pasta `sons/` 
 
 ## Como usar
 
-1. Clique em uma tecla vazia da janela e escolha um som. Com o botão direito, você troca, toca ou remove o som.
+1. Clique em uma tecla vazia da janela e escolha um som. Com o botão direito, você troca, grava pelo microfone, toca ou remove o som. O botão **🎙 Gravar som** também abre o gravador.
 2. Aperte **Ctrl + 0** para ativar o modo e use o teclado numérico para tocar.
 3. Fechar a janela (X) só esconde o programa na bandeja. Para fechar de vez, clique com o botão direito no ícone e escolha **Sair**.
 

@@ -12,15 +12,20 @@ perto do relógio. Para sair de vez, use "Sair" no menu do ícone.
 Dependências:  pip install keyboard pygame-ce pystray pillow
 """
 
+import array
 import ctypes
 import json
 import multiprocessing as mp
 import os
 import queue
+import re
 import shutil
 import sys
+import tempfile
 import tkinter as tk
+import wave
 import winreg
+from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -222,6 +227,244 @@ class SaidaExtra:
         self.fila = None
 
 
+TAXA_GRAVACAO = 44100
+MAX_SEGUNDOS = 60
+
+
+class Gravador:
+    """Grava do microfone pelo SDL do pygame-ce (16 bits, mono, 44,1 kHz)."""
+
+    def __init__(self):
+        self.dev = None
+        self.blocos = []
+        self.nivel = 0      # pico do último bloco (0 a 32768), para o medidor
+        self.pico_total = 0
+
+    @staticmethod
+    def listar():
+        try:
+            from pygame._sdl2.audio import get_audio_device_names
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            return list(get_audio_device_names(True))
+        except Exception:
+            return []
+
+    def iniciar(self, microfone):
+        from pygame._sdl2.audio import AUDIO_S16, AudioDevice
+        self.blocos, self.nivel, self.pico_total = [], 0, 0
+        self.dev = AudioDevice(devicename=microfone, iscapture=True, frequency=TAXA_GRAVACAO,
+                               audioformat=AUDIO_S16, numchannels=1, chunksize=1024,
+                               allowed_changes=0, callback=self._receber)
+        self.dev.pause(0)
+
+    def _receber(self, _dev, memoria):  # roda na thread de áudio do SDL
+        dados = bytes(memoria)
+        self.blocos.append(dados)
+        amostras = array.array("h", dados)
+        if amostras:
+            self.nivel = max(-min(amostras), max(amostras))
+            self.pico_total = max(self.pico_total, self.nivel)
+
+    def parar(self):
+        if self.dev is not None:
+            self.dev.pause(1)
+            self.dev.close()
+            self.dev = None
+        return b"".join(self.blocos)
+
+    def segundos(self):
+        return sum(len(b) for b in self.blocos) / 2 / TAXA_GRAVACAO
+
+    @staticmethod
+    def cortar_silencio(dados, limiar=700, folga=0.12):
+        """Tira o silêncio do começo e do fim, deixando uma pequena folga."""
+        a = array.array("h", dados)
+        altos = [i for i in range(0, len(a), 64) if abs(a[i]) > limiar]
+        if not altos:
+            return dados
+        f = int(folga * TAXA_GRAVACAO)
+        ini, fim = max(0, altos[0] - f), min(len(a), altos[-1] + f)
+        return a[ini:fim].tobytes()
+
+    @staticmethod
+    def salvar_wav(dados, caminho):
+        with wave.open(str(caminho), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(TAXA_GRAVACAO)
+            w.writeframes(dados)
+
+
+class JanelaGravar(tk.Toplevel):
+    """Janela para gravar um som pelo microfone e salvar numa tecla."""
+
+    def __init__(self, app, tecla=None):
+        super().__init__(app.root)
+        self.app = app
+        self.grav = Gravador()
+        self.gravando = False
+        self.dados = b""
+        self.previa = Path(tempfile.gettempdir()) / "voicepad_previa.wav"
+
+        self.title("Gravar som — VoicePad")
+        self.configure(bg=BG, padx=18, pady=14)
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self.fechar)
+
+        def rot(txt):
+            return tk.Label(self, text=txt, bg=BG, fg=TEXTO_FRACO, font=("Segoe UI", 9))
+
+        rot("Microfone").grid(row=0, column=0, sticky="w")
+        mics = Gravador.listar()
+        self.var_mic = tk.StringVar(value=mics[0] if mics else "")
+        ttk.Combobox(self, textvariable=self.var_mic, values=mics, state="readonly", width=46).grid(
+            row=1, column=0, columnspan=3, sticky="we", pady=(2, 10))
+
+        self.btn = tk.Button(self, text="●  Gravar", command=self.alternar, bg=VERMELHO, fg="white",
+                             relief="flat", font=("Segoe UI", 12, "bold"), pady=6,
+                             activebackground="#c0392b", activeforeground="white")
+        self.btn.grid(row=2, column=0, columnspan=3, sticky="we")
+
+        self.lbl_tempo = tk.Label(self, text="0,0 s", bg=BG, fg=TEXTO, font=("Segoe UI", 10))
+        self.lbl_tempo.grid(row=3, column=0, sticky="w", pady=(6, 0))
+        self.medidor = tk.Canvas(self, width=260, height=10, bg=PAD, highlightthickness=0)
+        self.medidor.grid(row=3, column=1, columnspan=2, sticky="e", pady=(6, 0))
+        self.barra = self.medidor.create_rectangle(0, 0, 0, 10, fill=VERDE, width=0)
+
+        self.lbl_aviso = tk.Label(self, text=f"Máximo de {MAX_SEGUNDOS} segundos.", bg=BG,
+                                  fg=TEXTO_FRACO, font=("Segoe UI", 8), justify="left", wraplength=340)
+        self.lbl_aviso.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 10))
+
+        # --- salvar
+        self.salvar_frame = tk.Frame(self, bg=BG)
+        self.salvar_frame.grid(row=5, column=0, columnspan=3, sticky="we")
+        sf = self.salvar_frame
+        tk.Label(sf, text="Nome", bg=BG, fg=TEXTO_FRACO, font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
+        self.var_nome = tk.StringVar(value=datetime.now().strftime("gravacao_%Y%m%d_%H%M%S"))
+        tk.Entry(sf, textvariable=self.var_nome, bg=PAD, fg=TEXTO, insertbackground=TEXTO,
+                 relief="flat", width=30).grid(row=0, column=1, sticky="we", padx=(8, 0))
+        tk.Label(sf, text="Tecla", bg=BG, fg=TEXTO_FRACO, font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.var_tecla = tk.StringVar(value=tecla or self._primeira_tecla_vazia())
+        ttk.Combobox(sf, textvariable=self.var_tecla, values=[str(i) for i in range(10)],
+                     state="readonly", width=5).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        self.var_cortar = tk.BooleanVar(value=True)
+        tk.Checkbutton(sf, text="Cortar silêncio do começo e do fim", variable=self.var_cortar,
+                       bg=BG, fg=TEXTO, selectcolor=PAD, activebackground=BG, activeforeground=TEXTO).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        acoes = tk.Frame(sf, bg=BG)
+        acoes.grid(row=3, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        acoes.columnconfigure((0, 1), weight=1, uniform="a")
+        self.btn_ouvir = tk.Button(acoes, text="▶  Ouvir", command=self.ouvir, bg=PAD, fg=TEXTO,
+                                   relief="flat", font=("Segoe UI", 9, "bold"), activebackground=PAD_HOVER)
+        self.btn_ouvir.grid(row=0, column=0, sticky="we", padx=(0, 4))
+        self.btn_salvar = tk.Button(acoes, text="✔  Salvar na tecla", command=self.salvar, bg=VERDE, fg=BG,
+                                    relief="flat", font=("Segoe UI", 9, "bold"), activebackground="#27ae60")
+        self.btn_salvar.grid(row=0, column=1, sticky="we", padx=(4, 0))
+        self._habilitar_salvar(False)
+        if not mics:
+            self.btn.configure(state="disabled")
+            self.lbl_aviso.configure(text="Nenhum microfone encontrado.", fg=VERMELHO)
+
+    def _primeira_tecla_vazia(self):
+        for t in "1234567890":
+            if not self.app._caminho_slot(t):
+                return t
+        return "1"
+
+    def _habilitar_salvar(self, sim):
+        apagado = {"bg": "#2a2a34", "state": "disabled", "disabledforeground": "#5a5a68"}
+        self.btn_ouvir.configure(**({"bg": PAD, "state": "normal"} if sim else apagado))
+        self.btn_salvar.configure(**({"bg": VERDE, "state": "normal"} if sim else apagado))
+
+    def alternar(self):
+        if self.gravando:
+            self.parar()
+        else:
+            self.iniciar()
+
+    def iniciar(self):
+        try:
+            self.grav.iniciar(self.var_mic.get())
+        except Exception as err:
+            messagebox.showerror("Gravar som", f"Não consegui abrir o microfone:\n{err}", parent=self)
+            return
+        self.gravando = True
+        self._habilitar_salvar(False)
+        self.btn.configure(text="■  Parar gravação", bg="#3a3a48", activebackground="#4a4a5a")
+        self.lbl_aviso.configure(text="Gravando… fale agora.", fg=TEXTO)
+        self._atualizar()
+
+    def _atualizar(self):
+        if not self.gravando:
+            return
+        seg = self.grav.segundos()
+        self.lbl_tempo.configure(text=f"{seg:.1f} s".replace(".", ","))
+        nivel = min(1.0, self.grav.nivel / 20000)
+        self.medidor.coords(self.barra, 0, 0, int(260 * nivel), 10)
+        self.medidor.itemconfigure(self.barra, fill=VERMELHO if nivel > 0.9 else VERDE)
+        if seg >= MAX_SEGUNDOS:
+            self.parar()
+            return
+        self.after(50, self._atualizar)
+
+    def parar(self):
+        self.gravando = False
+        self.dados = self.grav.parar()
+        self.medidor.coords(self.barra, 0, 0, 0, 10)
+        self.btn.configure(text="●  Gravar de novo", bg=VERMELHO, activebackground="#c0392b")
+        if not self.dados:
+            self.lbl_aviso.configure(text="Nada foi gravado.", fg=VERMELHO)
+            return
+        if self.grav.pico_total < 300:
+            self.lbl_aviso.configure(
+                fg=DESTAQUE,
+                text="A gravação ficou muda. Veja se o microfone certo está escolhido e se o Windows "
+                     "permite o acesso: Configurações > Privacidade > Microfone > "
+                     "\"Permitir que aplicativos da área de trabalho acessem o microfone\".")
+        else:
+            self.lbl_aviso.configure(text="Pronto! Ouça e salve numa tecla.", fg=VERDE)
+        self._habilitar_salvar(True)
+
+    def _dados_finais(self):
+        return Gravador.cortar_silencio(self.dados) if self.var_cortar.get() else self.dados
+
+    def ouvir(self):
+        Gravador.salvar_wav(self._dados_finais(), self.previa)
+        vol = self.app.var_volume.get() / 100
+        # Prefere a saída "ouvir também" (seus fones) para a prévia não ir para a call.
+        if self.app.extra.proc is not None:
+            self.app.extra.enviar("esquecer", str(self.previa))
+            self.app.extra.enviar("tocar", str(self.previa), self.app.var_volume2.get() / 100, False)
+        else:
+            self.app.audio.esquecer(str(self.previa))
+            self.app.audio.tocar(str(self.previa), vol, False)
+
+    def salvar(self):
+        tecla = self.var_tecla.get()
+        atual = self.app._caminho_slot(tecla)
+        if atual and not messagebox.askyesno(
+                "Gravar som", f"A tecla {tecla} já tem \"{atual.stem}\".\nSubstituir?", parent=self):
+            return
+        nome = re.sub(r'[\\/:*?"<>|]+', "_", self.var_nome.get()).strip() or "gravacao"
+        SONS_DIR.mkdir(exist_ok=True)
+        destino, n = SONS_DIR / f"{nome}.wav", 1
+        while destino.exists():
+            destino, n = SONS_DIR / f"{nome}_{n}.wav", n + 1
+        Gravador.salvar_wav(self._dados_finais(), destino)
+        self.app.atribuir(tecla, destino)
+        self.app._toast(f"🎙  Gravação salva na tecla {tecla}", "#7c3aed")
+        self.fechar()
+
+    def fechar(self):
+        if self.gravando:
+            self.gravando = False
+            self.grav.parar()
+        self.destroy()
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -243,6 +486,7 @@ class App:
 
         self.icone = None
         self.avisou_bandeja = False
+        self.janela_gravar = None
 
         self._montar_tela()
         self._iniciar_bandeja()
@@ -372,12 +616,24 @@ class App:
                 destino = SONS_DIR / f"{origem.stem}_{n}{origem.suffix}"
                 n += 1
             shutil.copy2(origem, destino)
+        self.atribuir(tecla, destino)
+
+    def atribuir(self, tecla, destino):
+        """Liga um arquivo (já dentro de sons/) a uma tecla."""
         antigo = self._caminho_slot(tecla)
         if antigo:
             self._esquecer(antigo)
-        self.cfg["slots"][tecla] =str(destino.relative_to(BASE))
+        self.cfg["slots"][tecla] = str(Path(destino).relative_to(BASE))
         self._salvar_config()
         self._atualizar_pad(tecla)
+
+    def abrir_gravador(self, tecla=None):
+        if self.janela_gravar is not None and self.janela_gravar.winfo_exists():
+            self.janela_gravar.lift()
+            self.janela_gravar.focus_force()
+            return
+        self._mostrar()
+        self.janela_gravar = JanelaGravar(self, tecla)
 
     def remover_som(self, tecla):
         antigo = self._caminho_slot(tecla)
@@ -428,7 +684,15 @@ class App:
         estilo = ttk.Style()
         estilo.theme_use("clam")
         estilo.configure("TCombobox", fieldbackground=PAD, background=PAD, foreground=TEXTO,
-                         arrowcolor=TEXTO)
+                         arrowcolor=TEXTO, bordercolor=PAD, lightcolor=PAD, darkcolor=PAD)
+        estilo.map("TCombobox",
+                   fieldbackground=[("readonly", PAD)], foreground=[("readonly", TEXTO)],
+                   selectbackground=[("readonly", PAD)], selectforeground=[("readonly", TEXTO)],
+                   background=[("active", PAD_HOVER), ("readonly", PAD)])
+        r.option_add("*TCombobox*Listbox.background", PAD)
+        r.option_add("*TCombobox*Listbox.foreground", TEXTO)
+        r.option_add("*TCombobox*Listbox.selectBackground", "#7c3aed")
+        r.option_add("*TCombobox*Listbox.selectForeground", "white")
 
         dispositivos = Audio.listar_dispositivos()
 
@@ -477,9 +741,15 @@ class App:
                        command=lambda: self._definir_iniciar(self.var_iniciar.get())).grid(
             row=6, column=0, columnspan=2, sticky="w")
 
-        tk.Button(ctrl, text="■  Parar tudo", command=self.parar_tudo, bg=VERMELHO, fg="white",
+        botoes = tk.Frame(ctrl, bg=BG)
+        botoes.grid(row=7, column=0, columnspan=2, sticky="we", pady=(10, 0))
+        botoes.columnconfigure((0, 1), weight=1, uniform="b")
+        tk.Button(botoes, text="🎙  Gravar som", command=self.abrir_gravador, bg="#7c3aed", fg="white",
                   relief="flat", font=("Segoe UI", 9, "bold"), padx=10,
-                  activebackground="#c0392b").grid(row=7, column=0, columnspan=2, sticky="we", pady=(10, 0))
+                  activebackground="#6d28d9", activeforeground="white").grid(row=0, column=0, sticky="we", padx=(0, 4))
+        tk.Button(botoes, text="■  Parar tudo", command=self.parar_tudo, bg=VERMELHO, fg="white",
+                  relief="flat", font=("Segoe UI", 9, "bold"), padx=10,
+                  activebackground="#c0392b", activeforeground="white").grid(row=0, column=1, sticky="we", padx=(4, 0))
 
     def _definir_iniciar(self, ligar):
         try:
@@ -516,6 +786,7 @@ class App:
                 return
             m = tk.Menu(self.root, tearoff=0)
             m.add_command(label="Escolher som…", command=lambda: self.escolher_som(tecla))
+            m.add_command(label="Gravar pelo microfone…", command=lambda: self.abrir_gravador(tecla))
             if self._caminho_slot(tecla):
                 m.add_command(label="Tocar", command=lambda: self.tocar_slot(tecla))
                 m.add_separator()
