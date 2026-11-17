@@ -1,0 +1,4 @@
+keyboard>=0.13.5
+pygame-ce>=2.5
+pystray>=0.19
+pillow>=10.0

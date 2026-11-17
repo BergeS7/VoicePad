@@ -1,0 +1,11 @@
+# Dados pessoais de cada usuário
+config.json
+sons/
+
+# Python
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+.venv/
